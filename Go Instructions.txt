@@ -1,0 +1,29 @@
+How to run it
+.\start.ps1
+Five windows open. After a few seconds of go run compilation, all services are live.
+
+Demo scenarios
+1. Happy path — see load balancing
+
+# Create a product (watch gateway logs alternate between :8082 and :8083)
+for ($i = 0; $i -lt 70; $i++) {
+    Invoke-RestMethod -Method POST -Uri http://localhost:8080/products `
+      -ContentType 'application/json' `
+      -Body '{"name":"Widget","price":9.99}'
+}
+2. Idempotency proof
+
+# Run this 3 times — you get the SAME order ID every time, not three orders
+Invoke-RestMethod -Method POST -Uri http://localhost:8080/orders `
+  -ContentType 'application/json' `
+  -Headers @{'Idempotency-Key'='my-order-001'} `
+  -Body '{"user_id":1,"items":[{"product_id":1,"quantity":2}]}'
+# Third response has X-Idempotent-Replayed: true
+3. Circuit breaker demo
+In the product-svc B :8083 window, set $env:LATENCY_MS = '5500' and restart. The gateway's 5 s timeout fires on every request to :8083. After 5 failures, cb_state flips to "open" — watch it live at:
+
+while ($true) { Invoke-RestMethod http://localhost:8080/gateway/status | ConvertTo-Json -Depth 5; Start-Sleep 2 }
+After 10 seconds, the breaker tries one "half-open" probe. If :8083 is still slow, it reopens. If you lower the latency back, the probe succeeds and it closes.
+
+4. Switch load-balancing algorithm
+Stop the gateway, set $env:LB_ALGO = 'least-connections', restart.
