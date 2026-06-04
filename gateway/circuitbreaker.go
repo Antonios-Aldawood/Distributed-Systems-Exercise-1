@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -8,18 +9,8 @@ import (
 type cbState int
 
 const (
-	// cbClosed is the normal operating state. All requests pass through.
-	cbClosed cbState = iota
-
-	// cbOpen means the downstream service is considered unhealthy.
-	// All requests are rejected immediately (fail fast) so callers get a fast
-	// error instead of waiting for a timeout. This prevents one slow service
-	// from blocking threads/goroutines across the whole system.
+	cbClosed   cbState = iota
 	cbOpen
-
-	// cbHalfOpen is the recovery probe state. After openDuration has elapsed,
-	// exactly one request is allowed through to test whether the service
-	// has recovered. All other concurrent requests are still rejected.
 	cbHalfOpen
 )
 
@@ -28,20 +19,25 @@ const (
 // State machine:
 //
 //	Closed ──(failures >= threshold)──► Open
-//	Open   ──(openDuration elapsed)───► HalfOpen (one probe allowed)
+//	Open   ──(openDuration elapsed)───► HalfOpen  (one probe allowed)
 //	HalfOpen ──(probe succeeds)───────► Closed
-//	HalfOpen ──(probe fails)──────────► Open (timer reset)
+//	HalfOpen ──(probe fails)──────────► Open       (timer reset)
+//
+// Every transition publishes an Event to the global SSE bus so the frontend
+// sees circuit-breaker changes in real time without polling.
 type CircuitBreaker struct {
 	mu           sync.Mutex
+	name         string        // backend URL — used in event messages
 	state        cbState
 	failures     int
-	threshold    int           // consecutive failures before opening
-	openDuration time.Duration // how long to stay Open before probing
+	threshold    int
+	openDuration time.Duration
 	lastFailure  time.Time
 }
 
-func NewCircuitBreaker(threshold int, openDuration time.Duration) *CircuitBreaker {
+func NewCircuitBreaker(name string, threshold int, openDuration time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{
+		name:         name,
 		threshold:    threshold,
 		openDuration: openDuration,
 		state:        cbClosed,
@@ -49,8 +45,7 @@ func NewCircuitBreaker(threshold int, openDuration time.Duration) *CircuitBreake
 }
 
 // Allow reports whether a request to this backend should be attempted.
-// Calling Allow() in HalfOpen "consumes" the probe slot — subsequent
-// callers will receive false until the probe completes.
+// Transitions Open → HalfOpen when the cooldown has elapsed.
 func (cb *CircuitBreaker) Allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -60,7 +55,13 @@ func (cb *CircuitBreaker) Allow() bool {
 	case cbOpen:
 		if time.Since(cb.lastFailure) >= cb.openDuration {
 			cb.state = cbHalfOpen
-			return true // let the probe through
+			globalBus.Publish(Event{
+				Type:    "cb",
+				Message: "→ HALF-OPEN: sending probe request",
+				Backend: cb.name,
+				Status:  "half-open",
+			})
+			return true
 		}
 		return false
 	case cbHalfOpen:
@@ -69,23 +70,53 @@ func (cb *CircuitBreaker) Allow() bool {
 	return false
 }
 
-// RecordSuccess resets the breaker to Closed on any successful response.
+// RecordSuccess resets the breaker to Closed.
+// Emits an event when recovering from Open or HalfOpen.
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	prev := cb.state
 	cb.failures = 0
 	cb.state = cbClosed
+	if prev != cbClosed {
+		msg := "→ CLOSED (probe succeeded — service recovered)"
+		if prev == cbOpen {
+			msg = "→ CLOSED (recovered)"
+		}
+		globalBus.Publish(Event{
+			Type:    "cb",
+			Message: msg,
+			Backend: cb.name,
+			Status:  "closed",
+		})
+	}
 }
 
-// RecordFailure increments the failure counter and opens the breaker
-// once the threshold is crossed.
+// RecordFailure increments the failure counter and opens the breaker when the
+// threshold is crossed. Also handles HalfOpen → Open (probe failed).
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.failures++
 	cb.lastFailure = time.Now()
+
+	prev := cb.state
 	if cb.failures >= cb.threshold {
 		cb.state = cbOpen
+	}
+
+	// Emit only on transition into Open to avoid flooding the event bus.
+	if cb.state == cbOpen && prev != cbOpen {
+		msg := fmt.Sprintf("→ OPEN (%d consecutive failures)", cb.failures)
+		if prev == cbHalfOpen {
+			msg = "→ re-OPEN (probe failed)"
+		}
+		globalBus.Publish(Event{
+			Type:    "cb",
+			Message: msg,
+			Backend: cb.name,
+			Status:  "open",
+		})
 	}
 }
 

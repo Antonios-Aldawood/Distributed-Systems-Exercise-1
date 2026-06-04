@@ -7,12 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
 // hopHeaders must not be forwarded to or from upstream services.
-// They describe a single transport hop, not the end-to-end request.
 var hopHeaders = map[string]bool{
 	"Connection":          true,
 	"Keep-Alive":          true,
@@ -29,22 +30,18 @@ var hopHeaders = map[string]bool{
 // per-request timeout budget.
 type Proxy struct {
 	lb         *LoadBalancer
-	timeout    time.Duration // total budget for all attempts combined
+	timeout    time.Duration
 	maxRetries int
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Propagate or generate a request ID. In a real system this would flow
-	// through every log line across every service, making distributed traces
-	// trivial to reconstruct.
 	reqID := r.Header.Get("X-Request-ID")
 	if reqID == "" {
 		reqID = fmt.Sprintf("%016x", rand.Uint64())
 	}
 	w.Header().Set("X-Request-ID", reqID)
 
-	// Buffer the entire body now. A request body is a one-shot stream — once
-	// read it's gone. We need to replay it identically on every retry attempt.
+	// Buffer the body so we can replay it on every retry attempt.
 	var body []byte
 	if r.Body != nil {
 		var err error
@@ -56,22 +53,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// One deadline shared across all retry attempts.
-	// Inheriting r.Context() means a client disconnect cancels everything
-	// automatically — we don't keep hammering a backend for a client that
-	// already left.
+	// Extract the real client IP for IP-Hash load balancing.
+	clientIP := extractIP(r)
+
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
 
 	var lastErr string
 	for attempt := 0; attempt <= p.maxRetries; attempt++ {
-		// Fast-exit if the overall deadline already fired.
 		if ctx.Err() != nil {
 			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
 			return
 		}
 
-		// Exponential backoff between retries (not before the first attempt).
 		if attempt > 0 {
 			delay := backoff(attempt)
 			slog.Info("backing off before retry",
@@ -88,7 +82,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		backend := p.lb.Pick()
+		// Pass the client IP so IP-Hash can route consistently.
+		backend := p.lb.Pick(clientIP)
 		if backend == nil {
 			http.Error(w, "no backends available", http.StatusServiceUnavailable)
 			return
@@ -96,21 +91,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		start := time.Now()
 		status, transportErr := p.forward(ctx, w, r, backend, body, reqID, attempt)
-		dur := time.Since(start)
-
-		if transportErr != nil {
-			lastErr = transportErr.Error()
-			slog.Warn("upstream transport error",
-				"request_id", reqID,
-				"method", r.Method,
-				"path", r.URL.Path,
-				"backend", backend.URL,
-				"attempt", attempt,
-				"duration", dur,
-				"err", transportErr,
-			)
-			continue // retry
-		}
+		elapsed := time.Since(start)
 
 		slog.Info("upstream response",
 			"request_id", reqID,
@@ -119,14 +100,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"backend", backend.URL,
 			"attempt", attempt,
 			"status", status,
-			"duration", dur,
+			"duration", elapsed,
+			"err", transportErr,
 		)
 
-		if !isRetriable(status) {
-			return // response already written inside forward()
+		if transportErr != nil {
+			lastErr = transportErr.Error()
+			continue
 		}
 
-		// Retriable status — body was discarded inside forward(), try again.
+		if !isRetriable(status) {
+			// Feed the latency sample back so LeastResponseTime stays accurate.
+			backend.RecordLatency(elapsed)
+			return
+		}
+
 		lastErr = fmt.Sprintf("status %d", status)
 	}
 
@@ -138,12 +126,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "service unavailable after retries: "+lastErr, http.StatusServiceUnavailable)
 }
 
-// forward sends one attempt to the given backend.
-//
-// On success (non-retriable status) it writes the full response to w and
-// returns (status, nil). On a retriable status it drains and discards the
-// body (so the connection returns to the pool) and returns (status, nil)
-// without writing to w. On a transport error it returns (0, err).
 func (p *Proxy) forward(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -160,7 +142,6 @@ func (p *Proxy) forward(
 		return 0, err
 	}
 
-	// Copy original headers, skip hop-by-hop.
 	for k, vs := range orig.Header {
 		if !hopHeaders[k] {
 			req.Header[k] = vs
@@ -169,7 +150,6 @@ func (p *Proxy) forward(
 	req.Header.Set("X-Request-ID", reqID)
 	req.Header.Set("X-Forwarded-For", orig.RemoteAddr)
 	if attempt > 0 {
-		// This header tells the service "this is retry N, apply idempotency logic."
 		req.Header.Set("X-Retry-Attempt", fmt.Sprintf("%d", attempt))
 	}
 
@@ -184,7 +164,6 @@ func (p *Proxy) forward(
 	defer resp.Body.Close()
 
 	if isRetriable(resp.StatusCode) {
-		// Drain so the underlying TCP connection can be reused.
 		io.Copy(io.Discard, resp.Body)
 		backend.cb.RecordFailure()
 		return resp.StatusCode, nil
@@ -192,7 +171,6 @@ func (p *Proxy) forward(
 
 	backend.cb.RecordSuccess()
 
-	// Write the upstream response to the client.
 	for k, vs := range resp.Header {
 		if !hopHeaders[k] {
 			for _, v := range vs {
@@ -203,4 +181,18 @@ func (p *Proxy) forward(
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 	return resp.StatusCode, nil
+}
+
+// extractIP pulls the real client IP from a request.
+// Checks X-Forwarded-For first (set by upstream proxies), falls back to RemoteAddr.
+func extractIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.SplitN(xff, ",", 2)
+		return strings.TrimSpace(parts[0])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }

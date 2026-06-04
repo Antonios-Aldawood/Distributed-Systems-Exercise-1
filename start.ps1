@@ -46,7 +46,16 @@ Start-Svc -Title "product-svc A :8082" -Dir "$root\product-service" -Env @{
 Start-Svc -Title "product-svc B :8083 (slow)" -Dir "$root\product-service" -Env @{
     PORT       = "8083"
     # $env:LATENCY_MS = '5500'
-    LATENCY_MS = "5500"   # simulated latency — raise to 5500 to trip the circuit breaker
+    LATENCY_MS = "400"   # simulated latency — raise to 5500 to trip the circuit breaker
+}
+
+Start-Svc -Title "product-svc C :8085 (medium)" -Dir "$root\product-service" -Env @{
+    PORT       = "8085"
+    LATENCY_MS = "150"   # medium latency — helps show Least-Response-Time learning
+}
+
+Start-Svc -Title "product-svc D :8086" -Dir "$root\product-service" -Env @{
+    PORT = "8086"        # fast — same as :8082
 }
 
 Start-Svc -Title "order-service :8084" -Dir "$root\order-service" -Env @{
@@ -60,7 +69,10 @@ Start-Svc -Title "gateway       :8080" -Dir "$root\gateway" -Env @{
 }
 
 Write-Host ""
-Write-Host "All services starting. Allow a few seconds for compilation." -ForegroundColor Green
+Write-Host "All services starting (7 windows). Allow ~10 s for compilation." -ForegroundColor Green
+Write-Host ""
+Write-Host "  Frontend:  http://localhost:8080/" -ForegroundColor Cyan
+Write-Host "  Status:    http://localhost:8080/gateway/status" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "── Quick-start commands ─────────────────────────────────────────" -ForegroundColor Yellow
 Write-Host ""
