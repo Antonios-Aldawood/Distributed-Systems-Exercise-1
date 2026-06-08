@@ -199,6 +199,7 @@ func main() {
 
 	// ── Simulation ────────────────────────────────────────────────────────────
 	mux.Handle("POST /simulate/flood", handleFlood(productLB))
+	mux.Handle("POST /simulate/warmup", handleWarmup(productLB))
 
 	// ── Frontend ──────────────────────────────────────────────────────────────
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

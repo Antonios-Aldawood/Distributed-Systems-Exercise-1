@@ -171,6 +171,26 @@ code { background: #21262d; padding: 1px 4px; border-radius: 3px; color: #e3b341
       <label>Product ID: <input type="number" id="flood-pid" value="1" min="1" style="width:50px"></label>
       <button class="go" onclick="runFlood()">Flood ▶</button>
     </div>
+
+    <div class="algo-row" style="margin-top:10px;padding-top:10px;border-top:1px solid #21262d">
+      <label>Preload backend:
+        <select id="warmup-port">
+          <option value="8082">:8082</option>
+          <option value="8083" selected>:8083 (slow)</option>
+          <option value="8085">:8085</option>
+          <option value="8086">:8086</option>
+        </select>
+      </label>
+      <label>Long-running connections: <input type="number" id="warmup-n" value="6" min="1" max="50" style="width:50px"></label>
+      <button class="go" onclick="runWarmupThenFlood()">Preload ▶ then Flood</button>
+    </div>
+    <p style="font-size:0.7em;color:#6e7681;margin-top:6px">
+      Makes <strong>Least Connections</strong> visually obvious: raise the chosen backend's latency first
+      (Circuit-Breaker panel above), then click this — it launches N long-running requests <em>directly</em>
+      against that backend (bypassing the load balancer) to inflate its in-flight connection count, waits a
+      moment for that to register, then immediately fires the flood. Watch Least-Connections steer the new
+      burst away from the loaded instance, while Round-Robin keeps sending it a blind, equal share.
+    </p>
     <div id="flood-chart" class="chart"></div>
   </div>
 
@@ -492,6 +512,31 @@ async function runFlood() {
 
     renderChart(d);
   } catch(e) { log('✗ Flood error: ' + e, 'err'); }
+}
+
+// Preloads a single backend with N long-running direct connections (so its
+// active-connection count rises and stays elevated), then fires the flood
+// immediately after — the clearest possible visual proof of what
+// Least-Connections does differently from Round Robin.
+async function runWarmupThenFlood() {
+  const port = document.getElementById('warmup-port').value;
+  const cnt  = parseInt(document.getElementById('warmup-n').value) || 6;
+
+  log(`▶ Preloading :${port} with ${cnt} long-running direct connections…`, 'req');
+  try {
+    const r = await fetch('/simulate/warmup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({port, count: cnt}),
+    });
+    if (!r.ok) { log(`✗ Preload failed: ${await r.text()}`, 'err'); return; }
+    const d = await r.json();
+    log(`   launched ${d.count} requests directly against ${(d.backend||'').replace('http://localhost','')} — its active-connection count is now rising`, 'info');
+    log(`   (tip: raise that backend's latency first so the connections stay open long enough to matter)`, 'info');
+    log(`   waiting briefly for the connections to register, then flooding…`, 'info');
+    await new Promise(res => setTimeout(res, 500));
+    await runFlood();
+  } catch(e) { log('✗ Preload error: ' + e, 'err'); }
 }
 
 function renderChart(data) {

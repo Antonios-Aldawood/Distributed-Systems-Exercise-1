@@ -99,7 +99,30 @@ type LoadBalancer struct {
 	mu        sync.Mutex
 	backends  []*Backend
 	rrIdx     int
+	tieIdx    int // rotates the scan order for "pick the best" algorithms so ties don't always favour backends[0]
 	algorithm Algorithm
+}
+
+// rotateStart returns a rotating starting offset into a healthy-backend slice
+// of length n, advancing the rotation each call.
+//
+// Why this matters: pickLeastConnections, pickWeightedRoundRobin and
+// pickLeastResponseTime all scan the backend list and keep the "best" one
+// seen so far, breaking ties with a strict < / > comparison. A naive
+// left-to-right scan therefore ALWAYS resolves ties in favour of the first
+// backend in the slice — here, :8082. At idle/cold-start every backend looks
+// identical (0 active connections, 0 EWMA), so :8082 would systematically win
+// every tie and absorb a disproportionate share of traffic — exactly the bias
+// you observed. Rotating the scan's starting point each call spreads tie-wins
+// evenly across all backends over time, while leaving genuine (non-tied)
+// decisions completely untouched.
+func (lb *LoadBalancer) rotateStart(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	start := lb.tieIdx % n
+	lb.tieIdx++
+	return start
 }
 
 func NewLoadBalancer(configs []BackendConfig, algo Algorithm) *LoadBalancer {
@@ -189,8 +212,11 @@ func (lb *LoadBalancer) pickRoundRobin(healthy []*Backend) *Backend {
 }
 
 func (lb *LoadBalancer) pickLeastConnections(healthy []*Backend) *Backend {
+	n := len(healthy)
+	start := lb.rotateStart(n)
 	var best *Backend
-	for _, b := range healthy {
+	for i := 0; i < n; i++ {
+		b := healthy[(start+i)%n]
 		if best == nil || b.active.Load() < best.active.Load() {
 			best = b
 		}
@@ -198,7 +224,8 @@ func (lb *LoadBalancer) pickLeastConnections(healthy []*Backend) *Backend {
 	if best != nil && best.cb.Allow() {
 		return best
 	}
-	for _, b := range healthy {
+	for i := 0; i < n; i++ {
+		b := healthy[(start+i)%n]
 		if b != best && b.cb.Allow() {
 			return b
 		}
@@ -234,13 +261,16 @@ func (lb *LoadBalancer) pickRandom(healthy []*Backend) *Backend {
 //	Rnd5: A(3) B(-1)C(4) → pick C(→-2)   sequence: A C A B C
 //	Rnd6: A(6) B(0) C(0) → pick A(→ 0)   sequence: A C A B C A  ✓ (3:1:2)
 func (lb *LoadBalancer) pickWeightedRoundRobin(healthy []*Backend) *Backend {
+	n := len(healthy)
+	start := lb.rotateStart(n)
 	total := 0
 	for _, b := range healthy {
 		b.currentWeight += b.weight
 		total += b.weight
 	}
 	var best *Backend
-	for _, b := range healthy {
+	for i := 0; i < n; i++ {
+		b := healthy[(start+i)%n]
 		if best == nil || b.currentWeight > best.currentWeight {
 			best = b
 		}
@@ -296,14 +326,20 @@ func fnv32(s string) uint32 {
 // Backends with no recorded latency (ewma==0) are treated as fastest to
 // avoid cold-start penalisation of new instances.
 func (lb *LoadBalancer) pickLeastResponseTime(healthy []*Backend) *Backend {
+	n := len(healthy)
+	start := lb.rotateStart(n)
 	var best *Backend
-	for _, b := range healthy {
+	for i := 0; i < n; i++ {
+		b := healthy[(start+i)%n]
 		if best == nil {
 			best = b
 			continue
 		}
 		bu, beu := b.ewmaUs.Load(), best.ewmaUs.Load()
-		// 0 means "never measured" — prefer it (cold-start bias)
+		// 0 means "never measured" — prefer it (cold-start bias). Rotating the
+		// scan start means that during cold start (everyone at 0) each backend
+		// gets a turn at being the "last unmeasured one wins" pick, instead of
+		// the same one winning every single time.
 		if bu == 0 || (beu != 0 && bu < beu) {
 			best = b
 		}
@@ -311,7 +347,8 @@ func (lb *LoadBalancer) pickLeastResponseTime(healthy []*Backend) *Backend {
 	if best != nil && best.cb.Allow() {
 		return best
 	}
-	for _, b := range healthy {
+	for i := 0; i < n; i++ {
+		b := healthy[(start+i)%n]
 		if b != best && b.cb.Allow() {
 			return b
 		}
